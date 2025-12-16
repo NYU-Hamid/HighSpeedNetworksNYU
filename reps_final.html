@@ -1,0 +1,155 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>REPS Protocol</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@500;700&display=swap" rel="stylesheet">
+    <style>
+        body { margin:0; background:#fff; font-family:'Roboto', sans-serif; overflow:hidden; }
+        canvas { display:block; width:100vw; height:100vh; }
+        #controls {
+            position:absolute; bottom:20px; left:50%; transform:translateX(-50%);
+            background:#f4f4f4; padding:10px 20px; border-radius:8px; 
+            border:1px solid #ddd; display:flex; gap:15px; box-shadow:0 5px 15px rgba(0,0,0,0.1);
+        }
+        button { background:#333; color:#fff; border:none; padding:8px 16px; border-radius:4px; font-weight:bold; cursor:pointer; }
+        .legend { display:flex; gap:12px; align-items:center; font-size:12px; color:#555; }
+        .dot { width:10px; height:10px; display:inline-block; border:1px solid #999; }
+    </style>
+</head>
+<body>
+    <div style="position:absolute; top:20px; left:20px;">
+        <h1 style="margin:0; font-size:22px; color:#222;">REPS Protocol Simulator</h1>
+        <div style="color:#666; font-size:13px;">Exact Topology & Path Highlighting</div>
+    </div>
+
+    <div id="controls">
+        <button onclick="emit('start')">START</button>
+        <button onclick="emit('pause')">PAUSE</button>
+        <div class="legend">
+            <div><span class="dot" style="background:#00BFFF; border:none;"></span> Active Path</div>
+            <div><span class="dot" style="background:#fff"></span> Packet</div>
+            <div><span class="dot" style="background:#FFC0CB"></span> ECN</div>
+        </div>
+    </div>
+    <canvas id="c"></canvas>
+
+    <script>
+        const socket = io();
+        const cvs = document.getElementById('c');
+        const ctx = cvs.getContext('2d');
+        let W, H;
+        let state = null;
+
+        function resize() { W=window.innerWidth; H=window.innerHeight; cvs.width=W; cvs.height=H; }
+        window.addEventListener('resize', resize); resize();
+        function emit(cmd, val) { socket.emit('ctrl', {cmd, val}); }
+
+        // Exact geometry from reference
+        function getPort(n, targetNode) {
+            const nx = n.x/100*W, ny = n.y/100*H;
+            if(n.type==='host') return [nx, ny-15];
+
+            const tx = targetNode.x/100*W, ty = targetNode.y/100*H;
+            // Simple visual offsets to prevent wire overlap
+            let ox = 0, oy = 0;
+            if(tx < nx) ox = -10; else if(tx > nx) ox = 10;
+            if(ty < ny) oy = -15; else oy = 15;
+
+            return [nx+ox, ny+oy];
+        }
+
+        function draw() {
+            ctx.clearRect(0,0,W,H);
+            if(!state) { requestAnimationFrame(draw); return; }
+
+            // WIRES
+            state.links.forEach(l => {
+                const u = state.nodes[l.u], v = state.nodes[l.v];
+                const p1 = getPort(u,v), p2 = getPort(v,u);
+
+                ctx.beginPath(); ctx.moveTo(p1[0],p1[1]); ctx.lineTo(p2[0],p2[1]);
+                if(l.active > 0) {
+                    ctx.strokeStyle = '#00BFFF'; ctx.lineWidth = 3;
+                } else {
+                    ctx.strokeStyle = '#ddd'; ctx.lineWidth = 1.5;
+                }
+                ctx.stroke();
+            });
+
+            // NODES
+            Object.entries(state.nodes).forEach(([id, n]) => {
+                const x = n.x/100*W, y = n.y/100*H;
+                if(n.type !== 'host') {
+                    // Switch Rect
+                    const w = 54, h = 34;
+                    ctx.fillStyle = (n.type === 'core') ? '#4682B4' : '#87CEEB';
+                    ctx.strokeStyle = '#333'; ctx.lineWidth = 1.5;
+                    ctx.beginPath(); ctx.roundRect(x-w/2, y-h/2, w, h, 6); ctx.fill(); ctx.stroke();
+
+                    // Label
+                    ctx.fillStyle = '#fff'; ctx.font = "bold 12px sans-serif"; 
+                    ctx.textAlign = "center"; ctx.fillText(id, x, y+5);
+
+                    // Queue LED (Side)
+                    const qw = 8, qh = 24;
+                    ctx.fillStyle = '#eee'; ctx.strokeStyle='#999'; ctx.lineWidth=1;
+                    ctx.fillRect(x+w/2+4, y-qh/2, qw, qh); ctx.strokeRect(x+w/2+4, y-qh/2, qw, qh);
+
+                    const sh = qh/4;
+                    for(let i=0; i<4; i++) {
+                        if(i < n.q) {
+                            ctx.fillStyle = (i>=2) ? 'red' : 'lime';
+                            ctx.fillRect(x+w/2+5, y+qh/2-(i+1)*sh, qw-2, sh-1);
+                        }
+                    }
+
+                    // Ports
+                    ctx.fillStyle='#fff'; ctx.strokeStyle='#333';
+                    [-15, 15].forEach(ox => {
+                        [-17, 17].forEach(oy => {
+                            if(n.type==='edge' && oy < 0 && Math.abs(ox)>10) return; 
+                            ctx.beginPath(); ctx.arc(x+ox, y+oy, 3, 0, 6.28); ctx.fill(); ctx.stroke();
+                        });
+                    });
+
+                } else {
+                    // Host
+                    ctx.fillStyle = '#333'; ctx.fillRect(x-14, y-12, 28, 24);
+                    ctx.fillStyle = '#87CEEB'; ctx.fillRect(x-12, y-10, 24, 16);
+                    ctx.fillStyle = '#fff'; ctx.font="bold 10px sans-serif"; 
+                    ctx.textAlign="center"; ctx.fillText(id.split('_')[2], x, y+35);
+                }
+            });
+
+            // PACKETS
+            state.packets.forEach(p => {
+                const u = state.nodes[p.u], v = state.nodes[p.v];
+                const p1 = getPort(u,v), p2 = getPort(v,u);
+                const cx = p1[0]+(p2[0]-p1[0])*p.pct;
+                const cy = p1[1]+(p2[1]-p1[1])*p.pct;
+
+                ctx.save(); ctx.translate(cx, cy);
+
+                ctx.fillStyle = p.ack ? '#E6E6FA' : (p.ecn ? '#FFC0CB' : '#fff');
+                ctx.strokeStyle = p.ack ? 'purple' : (p.ecn ? 'red' : 'green');
+                ctx.lineWidth = 2;
+
+                ctx.beginPath(); ctx.roundRect(-20, -12, 40, 24, 4);
+                ctx.fill(); ctx.stroke();
+
+                ctx.fillStyle = '#000'; ctx.font="9px sans-serif"; ctx.textAlign="center";
+                ctx.fillText(`ID:${p.id}`, 0, -3);
+                ctx.fillText(`EV:${p.ev}`, 0, 8);
+
+                ctx.restore();
+            });
+            requestAnimationFrame(draw);
+        }
+        requestAnimationFrame(draw);
+        socket.on('frame', d => state = d);
+    </script>
+</body>
+</html>
+    

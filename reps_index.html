@@ -1,0 +1,166 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>REPS.NET - Professional</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=Roboto+Mono:wght@500&display=swap" rel="stylesheet">
+    <style>
+        body { margin:0; background:#0f172a; font-family:'Inter',sans-serif; overflow:hidden; color:#fff; }
+        canvas { display:block; width:100vw; height:100vh; }
+
+        #controls {
+            position:absolute; bottom:30px; left:50%; transform:translateX(-50%);
+            background:rgba(30,41,59,0.9); padding:10px 25px; border-radius:50px;
+            display:flex; gap:20px; align-items:center; border:1px solid rgba(255,255,255,0.1);
+            box-shadow:0 20px 50px rgba(0,0,0,0.5);
+        }
+        button {
+            background:#fff; border:none; padding:10px 20px; border-radius:50px;
+            font-weight:700; cursor:pointer; font-size:12px;
+        }
+        button:hover { transform:scale(1.05); }
+        .legend { display:flex; gap:10px; font-size:10px; color:#94a3b8; border-left:1px solid #475569; padding-left:15px; }
+        .dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:4px; }
+
+        #tip {
+            position:absolute; background:rgba(0,0,0,0.95); padding:12px; border-radius:8px;
+            font-family:'Roboto Mono',monospace; font-size:11px; display:none; pointer-events:none;
+            border:1px solid #334155; box-shadow:0 10px 30px rgba(0,0,0,0.5);
+        }
+        .kv { display:flex; justify-content:space-between; gap:15px; margin-bottom:4px; }
+    </style>
+</head>
+<body>
+    <div style="position:absolute; top:25px; left:30px; pointer-events:none;">
+        <h1 style="margin:0; font-size:24px; letter-spacing:-1px;">REPS<span style="color:#00BFFF">.NET</span></h1>
+        <div style="color:#64748b; font-size:12px; font-family:'Roboto Mono';">Fat-Tree Topology // Active Path Tracing</div>
+    </div>
+
+    <div id="controls">
+        <button onclick="emit('start')">START</button>
+        <button onclick="emit('pause')" style="background:transparent; color:#fff; border:1px solid #475569">PAUSE</button>
+        <div style="display:flex; flex-direction:column;">
+            <span style="font-size:8px; font-weight:700; color:#64748b;">SPEED</span>
+            <input type="range" min="0.1" max="2.0" step="0.1" value="0.6" oninput="emit('speed', this.value)">
+        </div>
+        <div class="legend">
+            <div><span class="dot" style="background:#00BFFF"></span>Path</div>
+            <div><span class="dot" style="background:#2ecc71"></span>Data</div>
+            <div><span class="dot" style="background:#e74c3c"></span>Congestion</div>
+        </div>
+    </div>
+
+    <div id="tip"></div>
+    <canvas id="c"></canvas>
+
+    <script>
+        const socket = io();
+        const canvas = document.getElementById('c');
+        const ctx = canvas.getContext('2d');
+        const tip = document.getElementById('tip');
+        let W, H;
+        let state = null;
+        let mouse = {x:0, y:0};
+
+        function resize() { W=window.innerWidth; H=window.innerHeight; canvas.width=W; canvas.height=H; }
+        window.addEventListener('resize', resize); resize();
+        function emit(cmd, val) { socket.emit('ctrl', {cmd, val}); }
+
+        function getPos(n1, n2) {
+            const nx = n1.x/100*W, ny = n1.y/100*H;
+            const tx = n2.x/100*W, ty = n2.y/100*H;
+            const ang = Math.atan2(ty-ny, tx-nx);
+            const dist = n1.type==='host' ? 15 : 20; 
+            if(n1.type==='host') return [nx, ny-15];
+            return [nx + Math.cos(ang)*dist, ny + Math.sin(ang)*dist];
+        }
+
+        function draw() {
+            ctx.clearRect(0,0,W,H);
+            if(!state) { requestAnimationFrame(draw); return; }
+
+            // 1. WIRES
+            state.links.forEach(l => {
+                const u = state.nodes[l.u], v = state.nodes[l.v];
+                const p1 = getPos(u, v), p2 = getPos(v, u);
+                const active = l.active > 0;
+
+                ctx.beginPath(); ctx.moveTo(p1[0], p1[1]); ctx.lineTo(p2[0], p2[1]);
+                ctx.strokeStyle = active ? '#00BFFF' : '#334155';
+                ctx.lineWidth = active ? 3 : 1;
+                ctx.shadowColor = '#00BFFF'; ctx.shadowBlur = active ? 15 : 0;
+                ctx.stroke(); ctx.shadowBlur=0;
+
+                if(l.bps > 0.5) {
+                    const mx = (p1[0]+p2[0])/2, my = (p1[1]+p2[1])/2;
+                    ctx.fillStyle='#0f172a'; ctx.fillRect(mx-10, my-6, 20, 12);
+                    ctx.fillStyle='#fff'; ctx.font="8px Inter"; ctx.textAlign="center";
+                    ctx.fillText(l.bps.toFixed(0)+"G", mx, my+3);
+                }
+            });
+
+            // 2. NODES
+            Object.entries(state.nodes).forEach(([id, n]) => {
+                const x = n.x/100*W, y = n.y/100*H;
+                if(n.type === 'switch') {
+                    ctx.fillStyle = '#1e293b'; ctx.strokeStyle='#475569'; ctx.lineWidth=2;
+                    ctx.beginPath(); ctx.arc(x, y, 18, 0, 6.28); ctx.fill(); ctx.stroke();
+
+                    // Buffer Ring
+                    if(n.q > 0) {
+                        ctx.strokeStyle = n.q>4 ? '#e74c3c' : '#2ecc71';
+                        ctx.beginPath(); ctx.arc(x, y, 15, -1.57, -1.57 + (n.q/n.cap)*6.28); ctx.stroke();
+                    }
+                    ctx.fillStyle='#fff'; ctx.font="bold 9px Inter"; ctx.textAlign="center";
+                    ctx.fillText(n.q, x, y+3);
+                } else {
+                    ctx.fillStyle = '#1e293b'; ctx.fillRect(x-10, y-10, 20, 20);
+                    // EV Dots
+                    n.reps.forEach((r,i) => {
+                        ctx.fillStyle = r.valid ? '#2ecc71' : '#e74c3c';
+                        ctx.fillRect(x-10 + i*2.5, y-14, 2, 2);
+                    });
+                }
+            });
+
+            // 3. PACKETS
+            state.packets.forEach(p => {
+                const u = state.nodes[p.u], v = state.nodes[p.v];
+                const p1 = getPos(u, v), p2 = getPos(v, u);
+                const cx = p1[0] + (p2[0]-p1[0])*p.pct;
+                const cy = p1[1] + (p2[1]-p1[1])*p.pct;
+
+                ctx.save(); ctx.translate(cx, cy);
+                const ang = Math.atan2(p2[1]-p1[1], p2[0]-p1[0]); ctx.rotate(ang);
+
+                // Capsule
+                const color = p.ack ? '#9b59b6' : (p.ecn ? '#e74c3c' : '#2ecc71');
+                ctx.fillStyle = color; ctx.shadowColor = color; ctx.shadowBlur = 10;
+                ctx.beginPath(); ctx.roundRect(-14, -7, 28, 14, 6); ctx.fill();
+
+                ctx.fillStyle='#fff'; ctx.font="bold 9px Roboto Mono"; 
+                ctx.textAlign="center"; ctx.fillText(p.ev, -5, 3);
+
+                ctx.restore();
+
+                // Hover
+                if(Math.hypot(mouse.x-cx, mouse.y-cy) < 20) {
+                    tip.style.display='block'; tip.style.left=(mouse.x+20)+'px'; tip.style.top=(mouse.y-20)+'px';
+                    tip.innerHTML = `
+                        <div class="kv"><span>ID</span><b>${p.id}</b></div>
+                        <div class="kv"><span>TYPE</span><b style="color:${color}">${p.type}</b></div>
+                        <div class="kv"><span>EV</span><b>${p.ev}</b></div>
+                        <div class="kv"><span>ECN</span><b>${p.ecn}</b></div>
+                    `;
+                }
+            });
+            requestAnimationFrame(draw);
+        }
+        requestAnimationFrame(draw);
+        window.onmousemove = e => { mouse.x=e.clientX; mouse.y=e.clientY; tip.style.display='none'; };
+        socket.on('frame', d => state = d);
+    </script>
+</body>
+</html>
+    

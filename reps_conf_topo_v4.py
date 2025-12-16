@@ -1,0 +1,408 @@
+import threading
+import time
+import random
+import networkx as nx
+import json
+import logging
+import webbrowser
+from flask import Flask, Response, request
+from flask_socketio import SocketIO, emit
+
+# ==============================================================================
+#  SCIENTIFIC CONFIGURATION
+# ==============================================================================
+ECMP_WIDTH = 8
+PACKET_SIZE_BYTES = 1500
+SIM_TICK_SEC = 0.02
+EWMA_ALPHA = 0.1
+
+DEFAULT_CONFIG = {
+    'num_pods': 2, 'num_cores': 2, 'aggs_per_pod': 2,
+    'edges_per_pod': 2, 'hosts_per_edge': 2, 'queue_cap': 16
+}
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+# ==============================================================================
+#  BACKEND SIMULATION
+# ==============================================================================
+class REPSSwitch:
+    def __init__(self, id, layer, capacity):
+        self.id = id;
+        self.layer = layer;
+        self.capacity = capacity;
+        self.queues = {}
+
+    def enqueue(self, next_hop):
+        if next_hop not in self.queues: self.queues[next_hop] = 0
+        if self.queues[next_hop] >= self.capacity: return False
+        self.queues[next_hop] += 1
+        return True
+
+    def dequeue(self, next_hop):
+        if next_hop in self.queues and self.queues[next_hop] > 0: self.queues[next_hop] -= 1
+
+    def get_load(self):
+        return sum(self.queues.values())
+
+    def check_ecn(self):
+        return self.get_load() >= (self.capacity * 0.5)
+
+
+class REPSHost:
+    def __init__(self, id):
+        self.id = id
+        self.ev_cache = [{'val': random.randint(10, 99), 'valid': True} for _ in range(ECMP_WIDTH)]
+        self.ptr = 0
+
+    def get_valid_ev(self):
+        for _ in range(ECMP_WIDTH):
+            idx = (self.ptr + _) % ECMP_WIDTH
+            if self.ev_cache[idx]['valid']:
+                self.ptr = (idx + 1) % ECMP_WIDTH
+                return self.ev_cache[idx]['val']
+        return 99
+
+    def invalidate_ev(self, ev):
+        for e in self.ev_cache:
+            if e['val'] == ev:
+                e['valid'] = False;
+                threading.Timer(5.0, lambda: self._heal(e)).start();
+                break
+
+    def _heal(self, e):
+        e['valid'] = True; e['val'] = random.randint(10, 99)
+
+
+class NetworkSimulation:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.reset_topology()
+
+    def reset_topology(self, config=None):
+        with self.lock:
+            self.graph = nx.Graph()
+            self.nodes = {}
+            self.links = []
+            self.packets = []
+            self.pkt_ctr = 0;
+            self.running = False
+            self.config = config if config else DEFAULT_CONFIG
+            self._build_topology()
+
+    def _build_topology(self):
+        C = int(self.config['num_cores']);
+        P = int(self.config['num_pods'])
+        A = int(self.config['aggs_per_pod']);
+        E = int(self.config['edges_per_pod'])
+        H = int(self.config['hosts_per_edge']);
+        Q = int(self.config['queue_cap'])
+
+        core_ids = []
+        for i in range(C):
+            cid = f"C{i + 1}"
+            self._add_node(cid, 'core', (i + 0.5) * (100 / C), 10, capacity=Q)
+            core_ids.append(cid)
+
+        pod_width = 100 / P
+        for p in range(P):
+            px = p * pod_width
+            agg_ids = []
+            for a in range(A):
+                aid = f"A{p + 1}_{a + 1}"
+                self._add_node(aid, 'agg', px + (a + 0.5) * (pod_width / A), 40, capacity=Q)
+                agg_ids.append(aid)
+                for c_idx, cid in enumerate(core_ids): self._add_link(aid, cid)
+
+            for e in range(E):
+                eid = f"E{p + 1}_{e + 1}"
+                self._add_node(eid, 'edge', px + (e + 0.5) * (pod_width / E), 70, capacity=Q)
+                for a_idx, aid in enumerate(agg_ids): self._add_link(eid, aid)
+
+                h_spread = (pod_width / E) * 0.8;
+                h_start = (px + (e + 0.5) * (pod_width / E)) - (h_spread / 2)
+                for h in range(H):
+                    hid = f"H{p + 1}_{e + 1}_{h + 1}"
+                    self._add_node(hid, 'host', h_start + (h + 0.5) * (h_spread / H), 92)
+                    self._add_link(eid, hid)
+
+    def _add_node(self, id, type, x, y, capacity=4):
+        self.graph.add_node(id, type=type, x=x, y=y)
+        if type != 'host':
+            self.nodes[id] = REPSSwitch(id, type, capacity)
+        else:
+            self.nodes[id] = REPSHost(id)
+
+    def _add_link(self, u, v):
+        key = tuple(sorted((u, v)))
+        if any(l['key'] == key for l in self.links): return
+        self.graph.add_edge(u, v)
+        self.links.append({'key': key, 'u': u, 'v': v, 'active': 0, 'bw': 10, 'throughput': 0.0, 'bytes_this_tick': 0})
+
+    def update_link_bw(self, u, v, bw):
+        key = tuple(sorted((u, v)))
+        with self.lock:
+            for l in self.links:
+                if l['key'] == key: l['bw'] = int(bw); break
+
+    def step(self):
+        with self.lock:
+            if random.random() < 0.8:
+                hosts = [n for n in self.nodes.values() if isinstance(n, REPSHost)]
+                if len(hosts) > 1:
+                    src, dst = random.sample(hosts, 2)
+                    ev = src.get_valid_ev()
+                    try:
+                        paths = list(nx.all_shortest_paths(self.graph, src.id, dst.id))
+                        path = paths[ev % len(paths)]
+                        self.pkt_ctr += 1
+                        self.packets.append(
+                            {'id': self.pkt_ctr, 'type': 'DATA', 'src': src.id, 'dst': dst.id, 'ev': ev, 'path': path,
+                             'hop': 0, 'pct': 0.0, 'ecn': False, 'ack': False, 'drop': False})
+                    except:
+                        pass
+
+            for l in self.links:
+                bits_sec = (l['bytes_this_tick'] * 8) / SIM_TICK_SEC
+                l['throughput'] = (1.0 - EWMA_ALPHA) * l['throughput'] + (EWMA_ALPHA * bits_sec)
+                l['bytes_this_tick'] = 0
+                if l['active'] > 0: l['active'] -= 1
+
+            alive = []
+            for p in self.packets:
+                if p['drop']: continue
+                p['pct'] += 0.04
+                if p['hop'] < len(p['path']) - 1:
+                    u, v = p['path'][p['hop']], p['path'][p['hop'] + 1]
+                    key = tuple(sorted((u, v)))
+                    if p['pct'] <= 0.04:
+                        for l in self.links:
+                            if l['key'] == key: l['bytes_this_tick'] += PACKET_SIZE_BYTES; l['active'] = 5; break
+                if p['pct'] >= 1.0:
+                    p['pct'] = 0.0
+                    curr = p['path'][p['hop']];
+                    target = p['src'] if p['ack'] else p['dst']
+                    if curr == target:
+                        if not p['ack']:
+                            ack = p.copy();
+                            ack['ack'] = True;
+                            ack['type'] = 'ACK';
+                            ack['path'] = p['path'][::-1];
+                            ack['hop'] = 0;
+                            ack['pct'] = 0.0;
+                            ack['id'] = self.pkt_ctr + 90000;
+                            alive.append(ack)
+                        elif p['ecn']:
+                            self.nodes[p['src']].invalidate_ev(p['ev'])
+                        continue
+                    if p['hop'] < len(p['path']) - 1:
+                        nxt = p['path'][p['hop'] + 1]
+                        cn = self.nodes.get(curr);
+                        nn = self.nodes.get(nxt)
+                        if isinstance(cn, REPSSwitch): cn.dequeue(nxt)
+                        if isinstance(nn, REPSSwitch):
+                            if not nn.enqueue(curr): p['drop'] = True; continue
+                            if nn.check_ecn(): p['ecn'] = True
+                        p['hop'] += 1;
+                        alive.append(p)
+                else:
+                    alive.append(p)
+            self.packets = alive
+
+    def get_state(self):
+        with self.lock:
+            nd = {}
+            for nid, node in self.nodes.items():
+                m = self.graph.nodes[nid]
+                d = {'x': m['x'], 'y': m['y'], 'type': m['type']}
+                if isinstance(node, REPSSwitch): d['q'] = node.get_load(); d['cap'] = node.capacity
+                nd[nid] = d
+
+            pd = []
+            for p in self.packets:
+                if not p['drop']:
+                    try:
+                        u = p['path'][p['hop']];
+                        v = p['path'][min(p['hop'] + 1, len(p['path']) - 1)]
+                        pd.append({'id': p['id'], 'u': u, 'v': v, 'pct': p['pct'], 'ev': p['ev'], 'ack': p['ack'],
+                                   'ecn': p['ecn']})
+                    except:
+                        pass
+
+            ld = []
+            for l in self.links:
+                cap_bps = l['bw'] * 1e9
+                util = (l['throughput'] / cap_bps) * 100.0 if cap_bps > 0 else 0.0
+                ld.append({'u': l['u'], 'v': l['v'], 'bw': l['bw'], 'util': util, 'active': l['active']})
+            return {'nodes': nd, 'links': ld, 'packets': pd}
+
+
+# ==============================================================================
+#  FRONTEND
+# ==============================================================================
+app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+sim = NetworkSimulation()
+
+HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>REPS Final</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <style>
+        body { margin:0; background:#f4f4f9; font-family:'Segoe UI',sans-serif; overflow:hidden; }
+        canvas { display:block; }
+        #config-panel { position:absolute; top:20px; left:20px; background:#fff; padding:15px; border-radius:8px; box-shadow:0 4px 15px rgba(0,0,0,0.1); width:200px; border-left: 5px solid #2980b9; }
+        .inp-group { margin-bottom:8px; display:flex; justify-content:space-between; align-items:center; }
+        label { font-size:12px; color:#555; }
+        input { width:40px; padding:3px; border:1px solid #ddd; border-radius:4px; text-align:center; }
+        button.action { width:100%; background:#2980b9; color:#fff; border:none; padding:8px; border-radius:4px; cursor:pointer; font-weight:bold; margin-top:5px; }
+        #link-modal { display:none; position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:#fff; padding:20px; border-radius:8px; box-shadow:0 10px 30px rgba(0,0,0,0.3); z-index:100; border:1px solid #ccc; width:220px; }
+        #modal-overlay { display:none; position:absolute; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.2); z-index:90; }
+        #controls { position:absolute; bottom:20px; right:20px; z-index:10; }
+        .ctrl-btn { background:#333; color:#fff; border:none; padding:10px 20px; border-radius:4px; font-weight:bold; cursor:pointer; margin-left:10px; }
+    </style>
+</head>
+<body>
+    <div id="config-panel">
+        <h3>Topology</h3>
+        <div class="inp-group"><label>Cores</label><input id="inp-c" type="number" value="2" min="1"></div>
+        <div class="inp-group"><label>Pods</label><input id="inp-p" type="number" value="2" min="1"></div>
+        <div class="inp-group"><label>Aggs</label><input id="inp-a" type="number" value="2" min="1"></div>
+        <div class="inp-group"><label>Edges</label><input id="inp-e" type="number" value="2" min="1"></div>
+        <div class="inp-group"><label>Hosts</label><input id="inp-h" type="number" value="2" min="1"></div>
+        <div class="inp-group"><label>Q Size</label><input id="inp-q" type="number" value="16" min="4"></div>
+        <button class="action" onclick="apply()">REBUILD</button>
+    </div>
+    <div id="controls"><button class="ctrl-btn" onclick="emit('start')">START</button><button class="ctrl-btn" onclick="emit('pause')">PAUSE</button></div>
+    <div id="modal-overlay"></div>
+    <div id="link-modal">
+        <h4>Link Config</h4>
+        <div class="inp-group"><label>BW (Gbps):</label><input id="link-bw" type="number" value="10"></div>
+        <input type="hidden" id="lu"><input type="hidden" id="lv">
+        <div style="text-align:right; margin-top:15px;"><button onclick="saveLink()" style="background:#2980b9; color:#fff; border:none; padding:5px; border-radius:4px;">Save</button></div>
+    </div>
+    <canvas id="c"></canvas>
+    <script>
+        const socket = io();
+        const cvs = document.getElementById('c');
+        const ctx = cvs.getContext('2d');
+        let W, H, state = null;
+        let linkHitboxes = [];
+        const NODE_WIDTH = 80, NODE_HEIGHT = 40, PORT_RADIUS = 3;
+
+        function resize() { W=window.innerWidth; H=window.innerHeight; cvs.width=W; cvs.height=H; }
+        window.addEventListener('resize', resize); resize();
+
+        socket.on('connect', () => { console.log("Connected"); });
+        socket.on('frame', d => { state = d; });
+        function emit(cmd, val) { socket.emit('ctrl', {cmd, val}); }
+        function apply() { emit('reset', { num_cores: document.getElementById('inp-c').value, num_pods: document.getElementById('inp-p').value, aggs_per_pod: document.getElementById('inp-a').value, edges_per_pod: document.getElementById('inp-e').value, hosts_per_edge: document.getElementById('inp-h').value, queue_cap: document.getElementById('inp-q').value }); }
+
+        cvs.addEventListener('click', e => {
+            const r = cvs.getBoundingClientRect(); const mx = e.clientX - r.left, my = e.clientY - r.top;
+            for(let b of linkHitboxes) { if(pointToLineDist(mx, my, b.x1, b.y1, b.x2, b.y2) < 10) { openModal(b.u, b.v, b.bw); return; } }
+        });
+        function pointToLineDist(x, y, x1, y1, x2, y2) { const A=x-x1, B=y-y1, C=x2-x1, D=y2-y1; const dot=A*C+B*D, len_sq=C*C+D*D; let param=-1; if(len_sq!=0) param=dot/len_sq; let xx, yy; if(param<0){xx=x1;yy=y1}else if(param>1){xx=x2;yy=y2}else{xx=x1+param*C;yy=y1+param*D} return Math.sqrt(Math.pow(x-xx,2)+Math.pow(y-yy,2)); }
+        function openModal(u, v, bw) { document.getElementById('lu').value=u; document.getElementById('lv').value=v; document.getElementById('link-bw').value=bw; document.getElementById('modal-overlay').style.display='block'; document.getElementById('link-modal').style.display='block'; }
+        function saveLink() { emit('set_link_bw', { u: document.getElementById('lu').value, v: document.getElementById('lv').value, bw: document.getElementById('link-bw').value }); document.getElementById('modal-overlay').style.display='none'; document.getElementById('link-modal').style.display='none'; }
+
+        function draw() {
+            ctx.clearRect(0,0,W,H);
+            if(!state) { requestAnimationFrame(draw); return; }
+            linkHitboxes = [];
+
+            state.links.forEach(l => {
+                const n1 = state.nodes[l.u], n2 = state.nodes[l.v];
+                const p1 = {x:n1.x/100*W, y:n1.y/100*H}, p2 = {x:n2.x/100*W, y:n2.y/100*H};
+
+                ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y);
+                ctx.strokeStyle = l.active > 0 ? '#3498db' : '#bdc3c7'; ctx.lineWidth = l.active > 0 ? 3 : 2; ctx.stroke();
+                linkHitboxes.push({u:l.u, v:l.v, x1:p1.x, y1:p1.y, x2:p2.x, y2:p2.y, bw:l.bw});
+
+                ctx.fillStyle='#fff'; ctx.strokeStyle='#7f8c8d'; ctx.lineWidth=1.5;
+                if(n1.type !== 'host') { ctx.beginPath(); ctx.arc(p1.x, p1.y, PORT_RADIUS, 0, 6.28); ctx.fill(); ctx.stroke(); }
+                if(n2.type !== 'host') { ctx.beginPath(); ctx.arc(p2.x, p2.y, PORT_RADIUS, 0, 6.28); ctx.fill(); ctx.stroke(); }
+
+                drawVerticalLabel(p1, p2, 0.2, l.util, l.bw);
+            });
+
+            Object.entries(state.nodes).forEach(([id, n]) => {
+                const cx = n.x/100*W, cy = n.y/100*H;
+                if(n.type !== 'host') {
+                    const w=NODE_WIDTH, h=NODE_HEIGHT;
+                    ctx.fillStyle = (n.type==='core') ? '#2980b9' : '#3498db'; ctx.strokeStyle = '#1a5276'; ctx.lineWidth=2;
+                    ctx.beginPath(); ctx.rect(cx-w/2, cy-h/2, w, h); ctx.fill(); ctx.stroke();
+                    ctx.fillStyle='#fff'; ctx.font="bold 12px Segoe UI"; ctx.textAlign="center"; ctx.fillText(id, cx-12, cy+5);
+                    const qx = cx+w/2 - 12, qH = 30;
+                    ctx.fillStyle="#ecf0f1"; ctx.fillRect(qx, cy-15, 8, qH); ctx.strokeRect(qx, cy-15, 8, qH);
+                    if(n.q > 0) { const hFill = Math.min(1.0, n.q/n.cap)*qH; ctx.fillStyle = n.q >= (n.cap/2) ? '#e74c3c' : '#2ecc71'; ctx.fillRect(qx, cy+15-hFill, 8, hFill); }
+                    const pct = Math.round((n.q/n.cap)*100); ctx.fillStyle="#333"; ctx.font="9px Arial"; ctx.textAlign="left"; ctx.fillText(pct+"%", qx+12, cy+5);
+                } else {
+                    ctx.fillStyle='#34495e'; ctx.fillRect(cx-12, cy-8, 24, 16);
+                    ctx.fillStyle='#fff'; ctx.font="9px Segoe UI"; ctx.textAlign="center"; ctx.fillText(id.split('_')[2], cx, cy+4);
+                }
+            });
+
+            state.packets.forEach(p => {
+                const n1=state.nodes[p.u], n2=state.nodes[p.v];
+                const p1={x:n1.x/100*W, y:n1.y/100*H}, p2={x:n2.x/100*W, y:n2.y/100*H};
+                const x = p1.x + (p2.x-p1.x)*p.pct; const y = p1.y + (p2.y-p1.y)*p.pct;
+                ctx.save(); ctx.translate(x,y);
+                const w=32, h=18;
+                ctx.fillStyle = p.ack ? '#e8daef' : (p.ecn ? '#fadbd8' : '#d5f5e3'); ctx.strokeStyle = p.ack ? '#8e44ad' : (p.ecn ? '#c0392b' : '#27ae60'); ctx.lineWidth=2;
+                ctx.beginPath(); ctx.rect(-w/2,-h/2,w,h); ctx.fill(); ctx.stroke();
+                ctx.fillStyle='#333'; ctx.font="9px Segoe UI"; ctx.textAlign="center"; ctx.fillText(p.ev, 0, 3);
+                ctx.fillStyle=ctx.strokeStyle; ctx.fillRect(-w/2,-h/2,w,4);
+                ctx.restore();
+            });
+            requestAnimationFrame(draw);
+        }
+
+        function drawVerticalLabel(p1, p2, t, util, bw) {
+            const mx = p1.x + (p2.x - p1.x) * t; const my = p1.y + (p2.y - p1.y) * t;
+            ctx.fillStyle = 'rgba(255,255,255,0.9)'; ctx.fillRect(mx-25, my-12, 50, 24);
+            ctx.strokeStyle = '#95a5a6'; ctx.lineWidth=1; ctx.strokeRect(mx-25, my-12, 50, 24);
+            ctx.fillStyle = '#2c3e50'; ctx.font="bold 10px Segoe UI"; ctx.textAlign="center";
+            ctx.fillText(`${util.toFixed(0)}%`, mx, my); ctx.fillText(`${bw}Gbps`, mx, my + 10);
+        }
+        requestAnimationFrame(draw);
+    </script>
+</body>
+</html>
+"""
+
+
+@app.route('/')
+def index(): return Response(HTML, mimetype='text/html')
+
+
+@socketio.on('ctrl')
+def handle_ctrl(d):
+    if d['cmd'] == 'start':
+        sim.running = True
+    elif d['cmd'] == 'pause':
+        sim.running = False
+    elif d['cmd'] == 'reset':
+        sim.reset_topology(d['val'])
+    elif d['cmd'] == 'set_link_bw':
+        sim.update_link_bw(d['val']['u'], d['val']['v'], d['val']['bw'])
+
+
+@socketio.on('connect')
+def handle_connect(): emit('frame', sim.get_state())
+
+
+def loop():
+    while True:
+        if sim.running: sim.step()
+        socketio.emit('frame', sim.get_state())
+        time.sleep(SIM_TICK_SEC)
+
+
+if __name__ == '__main__':
+    threading.Thread(target=loop, daemon=True).start()
+    webbrowser.open("http://127.0.0.1:5000")
+    socketio.run(app, port=5000, allow_unsafe_werkzeug=True)
