@@ -37,30 +37,28 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 class REPSSwitch:
     def __init__(self, id, layer, capacity):
         self.id = id
-        self.layer = layer
+        self.layer = layer  # 0=Edge, 1=Agg, 2=Core
         self.capacity = capacity
-        self.queues = {}
+        self.queues = {}  # Dynamic Map: {next_hop_id: count}
         self.ecn_threshold = max(1.0, capacity * 0.2)
 
-    def enqueue(self, next_hop):
-        if next_hop not in self.queues: self.queues[next_hop] = 0
-        if self.queues[next_hop] >= self.capacity:
-            return False
-        self.queues[next_hop] += 1
-        return True
-
-    def dequeue(self, next_hop):
-        if next_hop in self.queues and self.queues[next_hop] > 0: self.queues[next_hop] -= 1
-
-    def flush_queue(self, next_hop):
-        if next_hop in self.queues:
-            self.queues[next_hop] = 0
+    # Note: We no longer have persistent enqueue/dequeue methods.
+    # Queue sizes are calculated dynamically every tick.
 
     def get_load(self, next_hop):
         return self.queues.get(next_hop, 0)
 
     def check_ecn(self, next_hop):
         return self.get_load(next_hop) > self.ecn_threshold
+
+    def can_accept(self, next_hop):
+        # Check if there is space in the output queue for next_hop
+        return self.get_load(next_hop) < self.capacity
+
+    def register_packet(self, next_hop):
+        # Used during the tick to account for bursts
+        if next_hop not in self.queues: self.queues[next_hop] = 0
+        self.queues[next_hop] += 1
 
 
 class REPSHost:
@@ -97,44 +95,16 @@ class REPSHost:
         self.current_batch_sent = 0
         self.inflight_packets.clear()
 
-    def get_next_ev(self):
-        if self.num_valid_evs > 0:
-            offset = (self.head - self.num_valid_evs) % REPS_BUFFER_SIZE
-            self.buffer[offset]['valid'] = False
-            self.num_valid_evs -= 1
-            self.reused_count += 1
-            return self.buffer[offset]['ev']
-        else:
-            offset = self.head
-            self.head = (self.head + 1) % REPS_BUFFER_SIZE
-            if self.buffer[offset]['ev'] is None: return random.randint(0, EVS_SIZE - 1)
-            self.reused_count += 1
-            return self.buffer[offset]['ev']
-
-    def is_buffer_empty(self):
-        return all(entry['ev'] is None for entry in self.buffer)
-
-    def prepare_packet_ev(self):
-        cond1 = self.is_buffer_empty()
-        cond2 = (self.num_valid_evs == 0 and not self.is_freezing_mode)
-        cond3 = (self.explore_counter > 0)
-        if cond1 or cond2 or cond3:
-            ev = random.randint(0, EVS_SIZE - 1)
-            if self.explore_counter > 0: self.explore_counter -= 1
-            self.explored_count += 1
-            return ev
-        else:
-            return self.get_next_ev()
-
     def on_ack(self, pkt_id, ev, ecn, d_bit, current_tick):
         if pkt_id in self.inflight_packets: self.inflight_packets.remove(pkt_id)
-        if d_bit:
-            self.deflected_ack_count += 1
-            return
-        if ecn:
-            self.discarded_count += 1
-            return
 
+        # REPS Logic: If D-bit (Deflection) or ECN is set, the EV is bad.
+        if d_bit or ecn:
+            if d_bit: self.deflected_ack_count += 1
+            if ecn: self.discarded_count += 1
+            return  # Do not add to valid set
+
+        # Check if EV already exists
         existing_index = -1
         for i in range(REPS_BUFFER_SIZE):
             if self.buffer[i]['ev'] == ev: existing_index = i; break
@@ -148,6 +118,7 @@ class REPSHost:
             if not self.buffer[self.head]['valid']:
                 self.num_valid_evs += 1
                 if self.num_valid_evs > REPS_BUFFER_SIZE: self.num_valid_evs = REPS_BUFFER_SIZE
+
             self.buffer[self.head]['ev'] = ev
             self.buffer[self.head]['valid'] = True
             self.head = (self.head + 1) % REPS_BUFFER_SIZE
@@ -155,6 +126,30 @@ class REPSHost:
         if self.is_freezing_mode and current_tick > self.freezing_end_tick:
             self.is_freezing_mode = False
             self.explore_counter = NUM_PKTS_BDP
+
+    def get_next_ev(self):
+        # Scan for valid EV
+        for i in range(REPS_BUFFER_SIZE):
+            idx = (self.head + i) % REPS_BUFFER_SIZE
+            if self.buffer[idx]['valid']:
+                self.buffer[idx]['valid'] = False
+                self.num_valid_evs -= 1
+                self.reused_count += 1
+                return self.buffer[idx]['ev']
+        return random.randint(0, EVS_SIZE - 1)
+
+    def prepare_packet_ev(self):
+        cond1 = (self.num_valid_evs == 0)
+        cond2 = (self.num_valid_evs == 0 and not self.is_freezing_mode)
+        cond3 = (self.explore_counter > 0)
+
+        if cond1 or cond2 or cond3:
+            ev = random.randint(0, EVS_SIZE - 1)
+            if self.explore_counter > 0: self.explore_counter -= 1
+            self.explored_count += 1
+            return ev
+        else:
+            return self.get_next_ev()
 
     def on_failure_timeout(self, pkt_id, current_tick):
         if pkt_id in self.inflight_packets: self.inflight_packets.remove(pkt_id)
@@ -241,36 +236,40 @@ class NetworkSimulation:
             self.config['aggs_per_pod']), int(self.config['edges_per_pod']), int(self.config['hosts_per_edge'])
         Q = int(self.config['queue_cap'])
 
+        # Create Cores (Layer 2)
         core_ids = [f"C{i + 1}" for i in range(C)]
-        for i, c in enumerate(core_ids): self._add_node(c, 'core', (i + 0.5) * (100 / C), 10, capacity=Q)
+        for i, c in enumerate(core_ids): self._add_node(c, 'core', (i + 0.5) * (100 / C), 10, capacity=Q, layer=2)
 
         pod_width = 100 / P
         for p in range(P):
             px = p * pod_width
             aggs = []
+            # Create Aggregates (Layer 1)
             for a in range(A):
                 aid = f"A{p + 1}_{a + 1}"
-                self._add_node(aid, 'agg', px + (a + 0.5) * (pod_width / A), 30, capacity=Q)
+                self._add_node(aid, 'agg', px + (a + 0.5) * (pod_width / A), 30, capacity=Q, layer=1)
                 aggs.append(aid)
                 for c in core_ids: self._add_link(aid, c)
 
+            # Create Edges (Layer 0)
             for e in range(E_pod):
                 eid = f"E{p + 1}_{e + 1}"
-                self._add_node(eid, 'edge', px + (e + 0.5) * (pod_width / E_pod), 60, capacity=Q)
+                self._add_node(eid, 'edge', px + (e + 0.5) * (pod_width / E_pod), 60, capacity=Q, layer=0)
                 for agg in aggs: self._add_link(eid, agg)
                 h_spread = (pod_width / E_pod) * 0.8
                 h_start = (px + (e + 0.5) * (pod_width / E_pod)) - (h_spread / 2)
+                # Create Hosts (Layer -1)
                 for h in range(H_edge):
                     hid = f"H{p + 1}_{e + 1}_{h + 1}"
-                    self._add_node(hid, 'host', h_start + (h + 0.5) * (h_spread / H_edge), 90, 0)
+                    self._add_node(hid, 'host', h_start + (h + 0.5) * (h_spread / H_edge), 90, 0, layer=-1)
                     self._add_link(eid, hid)
 
-    def _add_node(self, id, type, x, y, capacity=4):
+    def _add_node(self, id, type, x, y, capacity=4, layer=0):
         self.graph.add_node(id, type=type, x=x, y=y)
         if type == 'host':
             self.nodes[id] = REPSHost(id)
         else:
-            self.nodes[id] = REPSSwitch(id, type, capacity)
+            self.nodes[id] = REPSSwitch(id, layer, capacity)
 
     def _add_link(self, u, v):
         key = tuple(sorted((u, v)))
@@ -285,10 +284,8 @@ class NetworkSimulation:
             for l in self.links:
                 if l['key'] == key: l['bw'] = new_bw; break
 
+            # If link dies, immediately mark packets on it as dropped
             if new_bw == 0:
-                if u in self.nodes and isinstance(self.nodes[u], REPSSwitch): self.nodes[u].flush_queue(v)
-                if v in self.nodes and isinstance(self.nodes[v], REPSSwitch): self.nodes[v].flush_queue(u)
-
                 for p in self.packets:
                     if p.get('drop', False): continue
                     if p['hop'] < len(p['path']) - 1:
@@ -308,6 +305,24 @@ class NetworkSimulation:
             src_id = "H1_1_1"
             dst_id = "H2_2_2"
 
+            # 1. DYNAMIC QUEUE CALCULATION (Fix for Ghost Buffers)
+            # Reset all queues to 0
+            for node in self.nodes.values():
+                if isinstance(node, REPSSwitch):
+                    node.queues = {}
+
+            # Recount based on actual packets in flight/queue
+            for p in self.packets:
+                if not p.get('drop', False) and not p.get('ack',
+                                                          False):  # Only data packets count for congestion usually, but ACKs are small
+                    if p['hop'] < len(p['path']) - 1:
+                        # Packet is traversing link from path[hop] to path[hop+1]
+                        # It counts towards queue of path[hop] directed to path[hop+1]
+                        u, v = p['path'][p['hop']], p['path'][p['hop'] + 1]
+                        if isinstance(self.nodes[u], REPSSwitch):
+                            self.nodes[u].register_packet(v)
+
+            # 2. PACKET GENERATION
             if self.nodes.get(src_id) and self.nodes.get(dst_id):
                 src_node = self.nodes[src_id]
                 src_node.current_tick = self.current_tick
@@ -331,6 +346,7 @@ class NetworkSimulation:
                     except:
                         pass
 
+            # 3. LINK METRICS
             for l in self.links:
                 bits_sec = (l['bytes_this_tick'] * 8) / SIM_TICK_SEC
                 l['throughput'] = (1.0 - EWMA_ALPHA) * l['throughput'] + (EWMA_ALPHA * bits_sec)
@@ -348,6 +364,7 @@ class NetworkSimulation:
 
                 if p['deflect_anim'] > 0: p['deflect_anim'] -= 1
 
+                # PACKET MOVEMENT
                 current_speed = base_speed
                 if p['hop'] < len(p['path']) - 1:
                     u, v = p['path'][p['hop']], p['path'][p['hop'] + 1]
@@ -362,6 +379,7 @@ class NetworkSimulation:
 
                 p['pct'] += current_speed
 
+                # Visual Link Activity
                 if p['hop'] < len(p['path']) - 1:
                     u, v = p['path'][p['hop']], p['path'][p['hop'] + 1]
                     key = tuple(sorted((u, v)))
@@ -369,9 +387,11 @@ class NetworkSimulation:
                         for l in self.links:
                             if l['key'] == key: l['bytes_this_tick'] += PACKET_SIZE_BYTES; l['active'] = 5; break
 
+                # --- PACKET ARRIVAL ---
                 if p['pct'] >= 1.0:
                     arrival_node_id = p['path'][p['hop'] + 1]
 
+                    # A. DESTINATION REACHED
                     if p['hop'] + 1 == len(p['path']) - 1:
                         if p['type'] == 'DATA':
                             ack = p.copy()
@@ -384,7 +404,10 @@ class NetworkSimulation:
                                 self.nodes[p['dst']].on_ack(p['acked_id'], p['ev'], p['ecn'], p['D'], self.current_tick)
                         continue
 
+                        # B. NEXT HOP DECISION (Switching Logic)
                     next_hop_id = p['path'][p['hop'] + 2]
+
+                    # Check 1: Is Link Alive?
                     link_alive = False
                     link_key = tuple(sorted((arrival_node_id, next_hop_id)))
                     for l in self.links:
@@ -392,59 +415,93 @@ class NetworkSimulation:
                             if l['bw'] > 0: link_alive = True
                             break
 
-                    if not link_alive:
-                        prev_node_id = p['path'][p['hop']]
-                        prev_obj = self.nodes.get(prev_node_id)
-                        if isinstance(prev_obj, REPSSwitch): prev_obj.dequeue(arrival_node_id)
+                    # Check 2: Is Next Queue Full? (Lookahead)
+                    arrival_obj = self.nodes.get(arrival_node_id)
+                    queue_full = False
+                    if isinstance(arrival_obj, REPSSwitch):
+                        if not arrival_obj.can_accept(next_hop_id):
+                            queue_full = True
 
+                    # --- C. DEFLECTION LOGIC ---
+                    if not link_alive or queue_full:
                         if self.use_deflection_mode and p['deflection_count'] < 3:
+                            # Try to find alternative
+                            p['D'] = True
+                            p['deflection_count'] += 1
+
                             neighbors = list(self.graph.neighbors(arrival_node_id))
-                            primary_candidates = []
-                            fallback_candidates = []
-                            prev_hop_id = p['path'][p['hop']]
+                            candidates = []
+                            prev_hop_id = p['path'][p['hop']]  # Avoid backtracking
 
                             for n in neighbors:
+                                # Filter 1: Link Active
                                 n_key = tuple(sorted((arrival_node_id, n)))
                                 is_alive = False
                                 for l in self.links:
                                     if l['key'] == n_key and l['bw'] > 0: is_alive = True; break
 
-                                if is_alive:
-                                    if n == prev_hop_id:
-                                        fallback_candidates.append(n)
-                                    else:
-                                        primary_candidates.append(n)
+                                # Filter 2: Queue Not Full (Lookahead)
+                                n_queue_full = False
+                                if isinstance(arrival_obj, REPSSwitch):
+                                    if not arrival_obj.can_accept(n): n_queue_full = True
 
-                            final_candidates = primary_candidates if primary_candidates else fallback_candidates
+                                if is_alive and not n_queue_full:
+                                    candidates.append(n)
 
-                            if final_candidates:
-                                best_cand = final_candidates[0]
-                                min_dist = 9999
+                            # PRIORITIZATION: Downstream (Lower Layer) > Lateral > Upstream
+                            def priority_key(n):
+                                n_obj = self.nodes[n]
+                                curr_obj = self.nodes[arrival_node_id]
+
+                                # Group 0: Downstream (Target Layer < Current Layer) -> Best
+                                # Group 1: Lateral (Equal)
+                                # Group 2: Upstream (Target Layer > Current Layer) -> Worst
+                                group = 2
+                                if n_obj.layer < curr_obj.layer:
+                                    group = 0
+                                elif n_obj.layer == curr_obj.layer:
+                                    group = 1
+
+                                # Backtracking penalty
+                                if n == prev_hop_id: group += 10
+
+                                # Tie-breaker: Distance to dest
+                                dist = 9999
                                 try:
-                                    for cand in final_candidates:
-                                        d = nx.shortest_path_length(self.graph, cand, p['dst'])
-                                        if d < min_dist: min_dist = d; best_cand = cand
+                                    dist = nx.shortest_path_length(self.graph, n, p['dst'])
                                 except:
                                     pass
 
-                                arrival_obj = self.nodes.get(arrival_node_id)
+                                return (group, dist)
+
+                            candidates.sort(key=priority_key)
+
+                            if candidates:
+                                best_cand = candidates[0]
+
+                                # Execute Deflection
                                 if isinstance(arrival_obj, REPSSwitch):
-                                    if arrival_obj.enqueue(best_cand):
-                                        self.deflected_packets_count += 1
-                                        p['D'] = True
-                                        p['deflection_count'] += 1
-                                        p['deflect_anim'] = DEFLECT_ANIMATION_FRAMES
+                                    # Register packet in new queue immediately for this tick's accounting
+                                    arrival_obj.register_packet(best_cand)
+                                    p['deflect_anim'] = DEFLECT_ANIMATION_FRAMES
 
-                                        try:
-                                            new_path = nx.shortest_path(self.graph, best_cand, p['dst'])
-                                            p['path'] = p['path'][:p['hop'] + 2] + new_path
-                                            p['hop'] += 1
-                                            p['pct'] = 0.0
-                                            alive.append(p)
-                                            continue
-                                        except:
-                                            pass
+                                    try:
+                                        # Recalculate path from new neighbor
+                                        new_path = nx.shortest_path(self.graph, best_cand, p['dst'])
+                                        # Path Stitching:
+                                        # path was [..., prev, arrival, next_hop (broken), ...]
+                                        # We are at 'arrival'. We want to go to 'best_cand'.
+                                        # New path segment starts at best_cand.
+                                        # So full path = [..., prev, arrival] + [best_cand, ...]
+                                        p['path'] = p['path'][:p['hop'] + 2] + new_path
+                                        p['hop'] += 1  # Advance hop to traversing (arrival -> best_cand)
+                                        p['pct'] = 0.0
+                                        alive.append(p)
+                                        continue
+                                    except:
+                                        pass
 
+                        # Drop if deflection impossible or disabled
                         self.dropped_packets_count += 1
                         p['drop'] = True;
                         p['drop_timer'] = DROP_ANIMATION_FRAMES;
@@ -454,26 +511,11 @@ class NetworkSimulation:
                         alive.append(p)
                         continue
 
-                    curr_obj = self.nodes.get(p['path'][p['hop']])
-                    arrival_obj = self.nodes.get(arrival_node_id)
-
+                    # --- D. NORMAL FORWARDING ---
+                    # Forwarding is valid. Register packet in queue for this tick.
                     if isinstance(arrival_obj, REPSSwitch):
-                        if not arrival_obj.enqueue(next_hop_id):
-                            if isinstance(curr_obj, REPSSwitch): curr_obj.dequeue(arrival_node_id)
-                            self.dropped_packets_count += 1
-                            p['drop'] = True;
-                            p['drop_timer'] = DROP_ANIMATION_FRAMES;
-                            p['pct'] = 1.0
-                            if p['src'] in self.nodes and isinstance(self.nodes[p['src']], REPSHost):
-                                self.nodes[p['src']].on_failure_timeout(p['id'], self.current_tick)
-                            alive.append(p)
-                            continue
-
+                        arrival_obj.register_packet(next_hop_id)
                         if arrival_obj.check_ecn(next_hop_id): p['ecn'] = True
-                        if isinstance(curr_obj, REPSSwitch): curr_obj.dequeue(arrival_node_id)
-
-                    elif isinstance(curr_obj, REPSSwitch):
-                        curr_obj.dequeue(arrival_node_id)
 
                     p['hop'] += 1
                     p['pct'] = 0.0
@@ -529,7 +571,79 @@ app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 sim = NetworkSimulation()
 
-HTML_PART_2 = """
+# HTML PARTS
+HTML_HEAD = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>REPS Final</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <style>
+        body { margin:0; background:#f4f4f9; font-family:'Segoe UI',sans-serif; overflow:hidden; }
+        canvas { display:block; }
+        #config-panel { position:absolute; top:20px; left:20px; background:#fff; padding:15px; border-radius:8px; box-shadow:0 4px 15px rgba(0,0,0,0.1); width:200px; border-left: 5px solid #2980b9; transition: height 0.3s; overflow: hidden; }
+        #config-header { display: flex; justify-content: space-between; align-items: center; cursor: pointer; margin-bottom: 12px; }
+        #config-header h3 { margin: 0; font-size: 16px; color: #333; }
+        #hamburger { font-size: 18px; color: #555; user-select: none; }
+        #config-content { display: block; }
+        .inp-group { margin-bottom:8px; display:flex; justify-content:space-between; align-items:center; }
+        label { font-size:12px; color:#555; }
+        input { width:40px; padding:3px; border:1px solid #ddd; border-radius:4px; text-align:center; }
+        button.action { width:100%; background:#2980b9; color:#fff; border:none; padding:8px; border-radius:4px; cursor:pointer; font-weight:bold; margin-top:5px; }
+        #link-modal { display:none; position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:#fff; padding:20px; border-radius:8px; box-shadow:0 10px 30px rgba(0,0,0,0.3); z-index:100; border:1px solid #ccc; width:220px; }
+        #entropy-modal { display:none; position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:#fff; padding:20px; border-radius:8px; box-shadow:0 10px 30px rgba(0,0,0,0.3); z-index:101; border:1px solid #ccc; width:480px; max-height:85vh; overflow-y:auto; }
+        #modal-overlay { display:none; position:absolute; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.2); z-index:90; }
+        #controls { position:absolute; bottom:20px; right:20px; z-index:10; display:flex; gap:10px; align-items:center; }
+        .ctrl-btn { background:#333; color:#fff; border:none; padding:10px 20px; border-radius:4px; font-weight:bold; cursor:pointer; }
+        .slider-container { background:rgba(255,255,255,0.9); padding:10px; border-radius:4px; display:flex; align-items:center; gap:10px; }
+        input[type=range] { width: 100px; }
+        .modal-close { position:absolute; top:10px; right:15px; cursor:pointer; font-size:20px; color:#999; }
+        .entropy-section { margin-bottom:15px; border-bottom:1px solid #eee; padding-bottom:12px; }
+        .entropy-stat { display:flex; justify-content:space-between; padding:4px 0; font-size:11px; margin:3px 0; }
+        .entropy-stat-label { color:#555; font-weight:bold; }
+        .entropy-stat-value { color:#2980b9; font-weight:bold; font-family:monospace; }
+        .buffer-entry { padding:8px; margin:4px 0; background:#f9f9f9; border-left:4px solid #ddd; border-radius:3px; font-family:monospace; font-size:11px; color:#333; }
+        .buffer-entry.valid { background:#e8f5e9; border-left-color:#4caf50; color:#2e7d32; font-weight:bold; }
+        .buffer-entry.head { background:#fff3e0; border-left-color:#ff9800; color:#e65100; font-weight:bold; }
+        #entropy-title { color:#2980b9; margin:0 0 12px 0; font-size:16px; border-bottom:2px solid #2980b9; padding-bottom:8px; }
+        .section-title { font-size:11px; font-weight:bold; color:#333; margin:8px 0 6px 0; padding:4px; background:#f0f0f0; border-radius:3px; }
+        .freezing-indicator { padding:8px; margin:10px 0; border-radius:4px; font-weight:bold; font-size:11px; text-align:center; background:#f5f5f5; color:#666; border:1px solid #ddd; }
+        .freezing-indicator.active { background:#ffebee; color:#c62828; border:1px solid #c62828; }
+        .mode-toggle { display:flex; align-items:center; justify-content:space-between; margin-top:15px; padding-top:10px; border-top:1px solid #eee; }
+        .switch { position: relative; display: inline-block; width: 40px; height: 20px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; -webkit-transition: .4s; transition: .4s; border-radius: 20px; }
+        .slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 2px; bottom: 2px; background-color: white; -webkit-transition: .4s; transition: .4s; border-radius: 50%; }
+        input:checked + .slider { background-color: #8e44ad; }
+        input:checked + .slider:before { -webkit-transform: translateX(20px); -ms-transform: translateX(20px); transform: translateX(20px); }
+        .mode-label { font-size:12px; font-weight:bold; color:#333; }
+    </style>
+</head>
+"""
+
+HTML_BODY = """
+<body>
+    <div id="config-panel">
+        <div id="config-header" onclick="toggleConfig()"><h3>Topology</h3><span id="hamburger">&#9776;</span></div>
+        <div id="config-content">
+            <div class="inp-group"><label>Cores</label><input id="inp-c" type="number" value="2" min="1"></div>
+            <div class="inp-group"><label>Pods</label><input id="inp-p" type="number" value="2" min="1"></div>
+            <div class="inp-group"><label>Aggs</label><input id="inp-a" type="number" value="2" min="1"></div>
+            <div class="inp-group"><label>Edges</label><input id="inp-e" type="number" value="2" min="1"></div>
+            <div class="inp-group"><label>Hosts</label><input id="inp-h" type="number" value="2" min="1"></div>
+            <div class="inp-group"><label>Q Size</label><input id="inp-q" type="number" value="16" min="4"></div>
+            <div class="mode-toggle"><span class="mode-label">Deflection Mode</span><label class="switch"><input type="checkbox" id="chk-deflection" onchange="toggleMode()"><span class="slider"></span></label></div>
+            <div class="inp-group" style="margin-top:15px; padding-top:5px; border-top:1px solid #eee;"><label style="color:#c0392b; font-weight:bold;">Dropped:</label><span id="disp-drops" style="font-weight:bold; color:#c0392b;">0</span></div>
+            <div class="inp-group"><label style="color:#8e44ad; font-weight:bold;">Deflected:</label><span id="disp-deflected" style="font-weight:bold; color:#8e44ad;">0</span></div>
+            <button class="action" onclick="apply()">REBUILD</button>
+        </div>
+    </div>
+    <div id="controls">
+        <div class="slider-container"><label style="font-weight:bold; color:#e67e22;">Pkts/Batch:</label><input type="range" min="0" max="10" step="1" value="0" id="batch-slider" oninput="updateBatch(this.value)"><span id="batch-val" style="font-weight:bold; color:#e67e22; margin-left:5px;">1</span></div>
+        <div class="slider-container"><label style="font-weight:bold;">Visual Speed:</label><input type="range" min="0.1" max="5.0" step="0.1" value="1.0" oninput="emit('speed', this.value)"></div>
+        <button class="ctrl-btn" onclick="emit('start')">START</button><button class="ctrl-btn" onclick="emit('pause')">PAUSE</button>
+    </div>
+    <div id="modal-overlay" onclick="closeModals()"></div>
     <div id="link-modal">
         <span class="modal-close" onclick="closeModals()">&times;</span>
         <h4>Link Config</h4>
@@ -749,13 +863,12 @@ HTML_PART_2 = """
                 } 
                 else {
                     ctx.translate(x, y); let bgColor = '#2980b9'; let scale = 1.0;
-                    if (p.deflect_anim > 0) {
-                        const anim_prog = (20 - p.deflect_anim) / 20; scale = 1.0 + Math.sin(anim_prog * 3.14) * 0.8; bgColor = '#e67e22'; 
+                    if (p.ack) {
+                        if (p.D) bgColor = '#e67e22'; // Orange ACK for deflection
+                        else bgColor = '#27ae60'; 
                     }
-                    else if (p.ack) {
-                        if (p.D) bgColor = '#8e44ad'; else bgColor = '#27ae60'; 
-                    }
-                    else if (p.D) bgColor = '#e67e22'; else if (p.ecn) bgColor = '#c0392b';
+                    else if (p.D) bgColor = '#e67e22'; // Orange Data for deflection
+                    else if (p.ecn) bgColor = '#c0392b';
                     ctx.scale(scale, scale); ctx.fillStyle = bgColor;
                 }
                 const w = p.ack ? 28 : 32, h = p.ack ? 54 : 60; 
@@ -783,80 +896,6 @@ HTML_PART_2 = """
         }
         requestAnimationFrame(draw);
     </script>
-"""
-
-HTML_PART_1 = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>REPS Final</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
-    <style>
-        body { margin:0; background:#f4f4f9; font-family:'Segoe UI',sans-serif; overflow:hidden; }
-        canvas { display:block; }
-        #config-panel { position:absolute; top:20px; left:20px; background:#fff; padding:15px; border-radius:8px; box-shadow:0 4px 15px rgba(0,0,0,0.1); width:200px; border-left: 5px solid #2980b9; transition: height 0.3s; overflow: hidden; }
-        #config-header { display: flex; justify-content: space-between; align-items: center; cursor: pointer; margin-bottom: 12px; }
-        #config-header h3 { margin: 0; font-size: 16px; color: #333; }
-        #hamburger { font-size: 18px; color: #555; user-select: none; }
-        #config-content { display: block; }
-        .inp-group { margin-bottom:8px; display:flex; justify-content:space-between; align-items:center; }
-        label { font-size:12px; color:#555; }
-        input { width:40px; padding:3px; border:1px solid #ddd; border-radius:4px; text-align:center; }
-        button.action { width:100%; background:#2980b9; color:#fff; border:none; padding:8px; border-radius:4px; cursor:pointer; font-weight:bold; margin-top:5px; }
-        #link-modal { display:none; position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:#fff; padding:20px; border-radius:8px; box-shadow:0 10px 30px rgba(0,0,0,0.3); z-index:100; border:1px solid #ccc; width:220px; }
-        #entropy-modal { display:none; position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:#fff; padding:20px; border-radius:8px; box-shadow:0 10px 30px rgba(0,0,0,0.3); z-index:101; border:1px solid #ccc; width:480px; max-height:85vh; overflow-y:auto; }
-        #modal-overlay { display:none; position:absolute; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.2); z-index:90; }
-        #controls { position:absolute; bottom:20px; right:20px; z-index:10; display:flex; gap:10px; align-items:center; }
-        .ctrl-btn { background:#333; color:#fff; border:none; padding:10px 20px; border-radius:4px; font-weight:bold; cursor:pointer; }
-        .slider-container { background:rgba(255,255,255,0.9); padding:10px; border-radius:4px; display:flex; align-items:center; gap:10px; }
-        input[type=range] { width: 100px; }
-        .modal-close { position:absolute; top:10px; right:15px; cursor:pointer; font-size:20px; color:#999; }
-        .entropy-section { margin-bottom:15px; border-bottom:1px solid #eee; padding-bottom:12px; }
-        .entropy-stat { display:flex; justify-content:space-between; padding:4px 0; font-size:11px; margin:3px 0; }
-        .entropy-stat-label { color:#555; font-weight:bold; }
-        .entropy-stat-value { color:#2980b9; font-weight:bold; font-family:monospace; }
-        .buffer-entry { padding:8px; margin:4px 0; background:#f9f9f9; border-left:4px solid #ddd; border-radius:3px; font-family:monospace; font-size:11px; color:#333; }
-        .buffer-entry.valid { background:#e8f5e9; border-left-color:#4caf50; color:#2e7d32; font-weight:bold; }
-        .buffer-entry.head { background:#fff3e0; border-left-color:#ff9800; color:#e65100; font-weight:bold; }
-        #entropy-title { color:#2980b9; margin:0 0 12px 0; font-size:16px; border-bottom:2px solid #2980b9; padding-bottom:8px; }
-        .section-title { font-size:11px; font-weight:bold; color:#333; margin:8px 0 6px 0; padding:4px; background:#f0f0f0; border-radius:3px; }
-        .freezing-indicator { padding:8px; margin:10px 0; border-radius:4px; font-weight:bold; font-size:11px; text-align:center; background:#f5f5f5; color:#666; border:1px solid #ddd; }
-        .freezing-indicator.active { background:#ffebee; color:#c62828; border:1px solid #c62828; }
-        .mode-toggle { display:flex; align-items:center; justify-content:space-between; margin-top:15px; padding-top:10px; border-top:1px solid #eee; }
-        .switch { position: relative; display: inline-block; width: 40px; height: 20px; }
-        .switch input { opacity: 0; width: 0; height: 0; }
-        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; -webkit-transition: .4s; transition: .4s; border-radius: 20px; }
-        .slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 2px; bottom: 2px; background-color: white; -webkit-transition: .4s; transition: .4s; border-radius: 50%; }
-        input:checked + .slider { background-color: #8e44ad; }
-        input:checked + .slider:before { -webkit-transform: translateX(20px); -ms-transform: translateX(20px); transform: translateX(20px); }
-        .mode-label { font-size:12px; font-weight:bold; color:#333; }
-    </style>
-</head>
-<body>
-    <div id="config-panel">
-        <div id="config-header" onclick="toggleConfig()"><h3>Topology</h3><span id="hamburger">&#9776;</span></div>
-        <div id="config-content">
-            <div class="inp-group"><label>Cores</label><input id="inp-c" type="number" value="2" min="1"></div>
-            <div class="inp-group"><label>Pods</label><input id="inp-p" type="number" value="2" min="1"></div>
-            <div class="inp-group"><label>Aggs</label><input id="inp-a" type="number" value="2" min="1"></div>
-            <div class="inp-group"><label>Edges</label><input id="inp-e" type="number" value="2" min="1"></div>
-            <div class="inp-group"><label>Hosts</label><input id="inp-h" type="number" value="2" min="1"></div>
-            <div class="inp-group"><label>Q Size</label><input id="inp-q" type="number" value="16" min="4"></div>
-            <div class="mode-toggle"><span class="mode-label">Deflection Mode</span><label class="switch"><input type="checkbox" id="chk-deflection" onchange="toggleMode()"><span class="slider"></span></label></div>
-            <div class="inp-group" style="margin-top:15px; padding-top:5px; border-top:1px solid #eee;"><label style="color:#c0392b; font-weight:bold;">Dropped:</label><span id="disp-drops" style="font-weight:bold; color:#c0392b;">0</span></div>
-            <div class="inp-group"><label style="color:#8e44ad; font-weight:bold;">Deflected:</label><span id="disp-deflected" style="font-weight:bold; color:#8e44ad;">0</span></div>
-            <button class="action" onclick="apply()">REBUILD</button>
-        </div>
-    </div>
-    <div id="controls">
-        <div class="slider-container"><label style="font-weight:bold; color:#e67e22;">Pkts/Batch:</label><input type="range" min="0" max="10" step="1" value="0" id="batch-slider" oninput="updateBatch(this.value)"><span id="batch-val" style="font-weight:bold; color:#e67e22; margin-left:5px;">1</span></div>
-        <div class="slider-container"><label style="font-weight:bold;">Visual Speed:</label><input type="range" min="0.1" max="5.0" step="0.1" value="1.0" oninput="emit('speed', this.value)"></div>
-        <button class="ctrl-btn" onclick="emit('start')">START</button><button class="ctrl-btn" onclick="emit('pause')">PAUSE</button>
-    </div>
-    <div id="modal-overlay" onclick="closeModals()"></div>
-"""
-
-HTML_FINAL = HTML_PART_1 + HTML_PART_2 + """
 </body>
 </html>
 """
@@ -864,7 +903,7 @@ HTML_FINAL = HTML_PART_1 + HTML_PART_2 + """
 
 @app.route('/')
 def index():
-    return Response(HTML_FINAL, mimetype='text/html')
+    return Response(HTML_HEAD + HTML_BODY, mimetype='text/html')
 
 
 @socketio.on('ctrl')
@@ -904,4 +943,4 @@ def loop():
 if __name__ == '__main__':
     threading.Thread(target=loop, daemon=True).start()
     webbrowser.open("http://127.0.0.1:5000")
-    socketio.run(app, port=5001, allow_unsafe_werkzeug=True)
+    socketio.run(app, port=5000, allow_unsafe_werkzeug=True)
